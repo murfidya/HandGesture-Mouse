@@ -81,7 +81,7 @@ Press `Ctrl+C` in the terminal, or close the camera window.
 | Setting | Description | Default |
 |---|---|---|
 | Pinch Threshold | How close fingers must be to trigger a pinch | 0.05 |
-| Smoothing | Cursor movement smoothing (higher = smoother but slower) | 0.10 |
+| Smoothing | Cursor movement smoothing (lower = smoother but slower) | 0.10 |
 
 ---
 
