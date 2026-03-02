@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""
+Hand Gesture Mouse Control - v3
+- Hand detection runs entirely in Python (OpenCV + MediaPipe)
+- Always-on-top floating camera window (tkinter) stays visible even when browser is minimized
+- WebSocket server sends mouse commands to pyautogui
+- Browser dashboard for settings/status (optional)
+
+Usage: python app.py
+"""
+
+import asyncio
+import json
+import threading
+import webbrowser
+import time
+import queue
+import math
+
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import (
+    HandLandmarker, HandLandmarkerOptions, RunningMode
+)
+import pyautogui
+import numpy as np
+from aiohttp import web
+
+# ── PyAutoGUI config ──────────────────────────────────────────────────────────
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
+
+screen_width, screen_height = pyautogui.size()
+print(f"Screen size: {screen_width}x{screen_height}")
+
+# ── Model path ────────────────────────────────────────────────────────────────
+import os
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+if not os.path.exists(MODEL_PATH):
+    print("Downloading hand_landmarker.task model...")
+    import urllib.request
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        MODEL_PATH
+    )
+    print("Model downloaded.")
+
+# ── Shared state (thread-safe via simple primitives) ──────────────────────────
+class AppState:
+    def __init__(self):
+        self.running = True
+        self.lock = threading.Lock()
+
+        # Settings (can be updated from browser)
+        self.pinch_threshold = 0.05
+        self.smoothing = 0.1
+        self.hand_range_min = 0.3
+        self.hand_range_max = 0.7
+
+        # Mouse state
+        self.curr_x = screen_width // 2
+        self.curr_y = screen_height // 2
+        self.last_left = False
+        self.last_right = False
+        self.last_scroll = False
+        self.smooth_scroll_y = None
+
+        # Scroll constants
+        self.SCROLL_SMOOTHING = 0.3
+        self.SCROLL_SENSITIVITY = 6000
+        self.SCROLL_DEAD_ZONE = 5
+
+        # Status for dashboard
+        self.hand_detected = False
+        self.gesture_left = False
+        self.gesture_right = False
+        self.gesture_scroll = False
+        self.fps = 0
+        self.gesture_count = 0
+
+        # Frame queue for tkinter window (latest frame only)
+        self.frame_queue = queue.Queue(maxsize=2)
+
+        # WebSocket clients for broadcasting status
+        self.ws_clients = set()
+
+state = AppState()
+
+# ── MediaPipe hand connections (for drawing) ──────────────────────────────────
+# New Tasks API: connections are frozensets of (start_idx, end_idx) tuples
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),       # thumb
+    (0,5),(5,6),(6,7),(7,8),       # index
+    (0,9),(9,10),(10,11),(11,12),  # middle
+    (0,13),(13,14),(14,15),(15,16),# ring
+    (0,17),(17,18),(18,19),(19,20),# pinky
+    (5,9),(9,13),(13,17),          # palm
+]
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+ACCENT       = (231, 92, 108)   # BGR: #6c5ce7 → purple
+ACCENT_LIGHT = (254, 155, 162)  # BGR: #a29bfe
+LEFT_COLOR   = (110, 203, 253)  # BGR: #fdcb6e → yellow
+RIGHT_COLOR  = (255, 185, 116)  # BGR: #74b9ff → blue
+SCROLL_COLOR = (254, 155, 162)  # BGR: #a29bfe → purple
+GREEN        = (0, 255, 0)
+RED          = (0, 0, 255)
+WHITE        = (255, 255, 255)
+DARK_BG      = (19, 15, 15)     # BGR: #0f0f13
+
+
+def dist(p1, p2):
+    return math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
+
+
+def remap(val, in_min, in_max):
+    val = max(in_min, min(val, in_max))
+    return (val - in_min) / (in_max - in_min)
+
+
+def draw_rounded_rect(img, pt1, pt2, color, radius=10, thickness=-1, alpha=0.6):
+    """Draw a semi-transparent rounded rectangle."""
+    overlay = img.copy()
+    x1, y1 = pt1
+    x2, y2 = pt2
+    cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
+    cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
+    cv2.circle(overlay, (x1 + radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x1 + radius, y2 - radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y2 - radius), radius, color, thickness)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+
+def draw_overlay(frame, hand_detected, is_left, is_right, is_scroll, fps):
+    """Draw HUD overlay on the camera frame."""
+    h, w = frame.shape[:2]
+
+    # Semi-transparent top bar
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 36), (20, 20, 30), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    # Title
+    cv2.putText(frame, "GestureMouse", (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (162, 155, 254), 1, cv2.LINE_AA)
+
+    # FPS
+    fps_text = f"FPS: {fps}"
+    cv2.putText(frame, fps_text, (w - 80, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (136, 136, 168), 1, cv2.LINE_AA)
+
+    # Hand status badge
+    if hand_detected:
+        badge_color = (201, 206, 0)   # BGR for teal
+        badge_text = "HAND DETECTED"
+    else:
+        badge_color = (100, 100, 120)
+        badge_text = "NO HAND"
+
+    overlay2 = frame.copy()
+    cv2.rectangle(overlay2, (8, h - 30), (8 + len(badge_text) * 9 + 8, h - 8),
+                  badge_color, -1)
+    cv2.addWeighted(overlay2, 0.35, frame, 0.65, 0, frame)
+    cv2.putText(frame, badge_text, (12, h - 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (0, 230, 220) if hand_detected else (100, 100, 120),
+                1, cv2.LINE_AA)
+
+    # Gesture indicators (bottom right)
+    gestures = [
+        ("L-CLICK", is_left,   LEFT_COLOR),
+        ("R-CLICK", is_right,  RIGHT_COLOR),
+        ("SCROLL",  is_scroll, SCROLL_COLOR),
+    ]
+    bx = w - 90
+    by = h - 30
+    for i, (label, active, color) in enumerate(gestures):
+        x = bx + i * 0  # stack vertically
+        y = by - i * 22
+        dot_color = color if active else (60, 60, 80)
+        cv2.circle(frame, (w - 85, y + 5), 5, dot_color, -1)
+        cv2.putText(frame, label, (w - 76, y + 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    color if active else (80, 80, 100),
+                    1, cv2.LINE_AA)
+
+
+def draw_hand_skeleton(frame, landmarks):
+    """Draw hand skeleton using manual connections (Tasks API compatible)."""
+    h, w = frame.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for (a, b) in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], ACCENT, 2, cv2.LINE_AA)
+    for pt in pts:
+        cv2.circle(frame, pt, 4, ACCENT_LIGHT, -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, 4, ACCENT, 1, cv2.LINE_AA)
+
+
+# ── Hand detection thread ─────────────────────────────────────────────────────
+def hand_detection_thread():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize capture buffer lag
+
+    frame_count = 0
+    fps_timer = time.time()
+    fps = 0
+
+    opts = HandLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=RunningMode.VIDEO,   # VIDEO mode uses tracking → much faster
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+    with HandLandmarker.create_from_options(opts) as detector:
+        while state.running:
+            ret, frame = cap.read()
+            if not ret:
+                continue  # no sleep — retry immediately to avoid frame-rate stall
+
+            frame_count += 1
+            now = time.time()
+            elapsed = now - fps_timer
+            if elapsed >= 1.0:
+                fps = int(frame_count / elapsed)
+                frame_count = 0
+                fps_timer = now
+                with state.lock:
+                    state.fps = fps
+
+            # Flip for mirror view
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # VIDEO mode requires a monotonically increasing timestamp in milliseconds
+            timestamp_ms = int(time.time() * 1000)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = detector.detect_for_video(mp_img, timestamp_ms)
+
+            hand_detected = False
+            is_left = is_right = is_scroll = False
+
+            if result.hand_landmarks:
+                hand_detected = True
+                landmarks = result.hand_landmarks[0]  # list of NormalizedLandmark
+
+                wrist     = landmarks[0]
+                thumb_tip = landmarks[4]
+                idx_tip   = landmarks[8]
+                mid_tip   = landmarks[12]
+                pnk_tip   = landmarks[20]
+
+                with state.lock:
+                    thresh    = state.pinch_threshold
+                    smoothing = state.smoothing
+                    rmin      = state.hand_range_min
+                    rmax      = state.hand_range_max
+
+                d_idx = dist(thumb_tip, idx_tip)
+                d_mid = dist(thumb_tip, mid_tip)
+                d_pnk = dist(thumb_tip, pnk_tip)
+
+                is_left   = d_idx < thresh
+                is_right  = d_mid < thresh
+                is_scroll = d_pnk < thresh
+
+                # Draw skeleton
+                draw_hand_skeleton(frame, landmarks)
+
+                # Draw pinch lines
+                h_px, w_px = frame.shape[:2]
+                if is_left:
+                    cv2.line(frame,
+                             (int(thumb_tip.x * w_px), int(thumb_tip.y * h_px)),
+                             (int(idx_tip.x * w_px),   int(idx_tip.y * h_px)),
+                             LEFT_COLOR, 3, cv2.LINE_AA)
+                if is_right:
+                    cv2.line(frame,
+                             (int(thumb_tip.x * w_px), int(thumb_tip.y * h_px)),
+                             (int(mid_tip.x * w_px),   int(mid_tip.y * h_px)),
+                             RIGHT_COLOR, 3, cv2.LINE_AA)
+                if is_scroll:
+                    cv2.line(frame,
+                             (int(thumb_tip.x * w_px), int(thumb_tip.y * h_px)),
+                             (int(pnk_tip.x * w_px),   int(pnk_tip.y * h_px)),
+                             SCROLL_COLOR, 3, cv2.LINE_AA)
+
+                # ── Mouse control ─────────────────────────────────────────────
+                x = remap(wrist.x, rmin, rmax)
+                y = remap(wrist.y, rmin, rmax)
+
+                with state.lock:
+                    target_x = x * screen_width
+                    target_y = y * screen_height
+                    state.curr_x += (target_x - state.curr_x) * smoothing
+                    state.curr_y += (target_y - state.curr_y) * smoothing
+                    state.curr_x = max(0, min(state.curr_x, screen_width - 1))
+                    state.curr_y = max(0, min(state.curr_y, screen_height - 1))
+                    cx, cy = int(state.curr_x), int(state.curr_y)
+                    last_left   = state.last_left
+                    last_right  = state.last_right
+                    last_scroll = state.last_scroll
+                    smooth_scroll_y = state.smooth_scroll_y
+
+                if is_scroll:
+                    if smooth_scroll_y is None or not last_scroll:
+                        smooth_scroll_y = y
+                    else:
+                        prev = smooth_scroll_y
+                        smooth_scroll_y += (y - smooth_scroll_y) * state.SCROLL_SMOOTHING
+                        delta = (smooth_scroll_y - prev) * -state.SCROLL_SENSITIVITY
+                        if abs(delta) > state.SCROLL_DEAD_ZONE:
+                            pyautogui.scroll(int(delta))
+                    with state.lock:
+                        state.smooth_scroll_y = smooth_scroll_y
+                else:
+                    pyautogui.moveTo(cx, cy)
+                    if is_left and not last_left:
+                        pyautogui.mouseDown()
+                    elif not is_left and last_left:
+                        pyautogui.mouseUp()
+                    if is_right and not last_right:
+                        pyautogui.click(button='right')
+
+                with state.lock:
+                    if is_left and not state.last_left:    state.gesture_count += 1
+                    if is_right and not state.last_right:  state.gesture_count += 1
+                    if is_scroll and not state.last_scroll: state.gesture_count += 1
+                    state.last_left   = is_left
+                    state.last_right  = is_right
+                    state.last_scroll = is_scroll
+
+            else:
+                with state.lock:
+                    state.last_left = state.last_right = state.last_scroll = False
+                    state.smooth_scroll_y = None
+
+            with state.lock:
+                state.hand_detected  = hand_detected
+                state.gesture_left   = is_left
+                state.gesture_right  = is_right
+                state.gesture_scroll = is_scroll
+
+            # Draw HUD
+            draw_overlay(frame, hand_detected, is_left, is_right, is_scroll, fps)
+
+            # Push frame to queue (drop old frame if full)
+            if state.frame_queue.full():
+                try:
+                    state.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                state.frame_queue.put_nowait(frame.copy())
+            except queue.Full:
+                pass
+
+    cap.release()
+
+
+# ── Always-on-top tkinter camera window ──────────────────────────────────────
+def run_camera_window():
+    """Runs the always-on-top floating camera preview using tkinter.
+    MUST be called from the main thread."""
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    root = tk.Tk()
+    root.title("GestureMouse — Camera")
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.95)
+    root.resizable(True, True)
+    root.configure(bg="#0f0f13")
+
+    # Window geometry: small preview, bottom-right
+    win_w, win_h = 320, 260
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    root.geometry(f"{win_w}x{win_h}+{sw - win_w - 20}+{sh - win_h - 60}")
+
+    # Title bar
+    title_bar = tk.Frame(root, bg="#1a1a24", height=28)
+    title_bar.pack(fill=tk.X, side=tk.TOP)
+    title_bar.pack_propagate(False)
+
+    tk.Label(title_bar, text="● LIVE  GestureMouse",
+             bg="#1a1a24", fg="#a29bfe",
+             font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=8)
+
+    # Minimize/restore button
+    minimized = [False]
+    def toggle_size():
+        if minimized[0]:
+            root.geometry(f"{win_w}x{win_h}")
+            minimized[0] = False
+        else:
+            root.geometry(f"{win_w}x30")
+            minimized[0] = True
+
+    tk.Button(title_bar, text="—", bg="#2a2a3d", fg="white",
+              relief=tk.FLAT, font=("Segoe UI", 9),
+              command=toggle_size, cursor="hand2",
+              padx=6).pack(side=tk.RIGHT, padx=4, pady=2)
+
+    # Canvas for video
+    canvas = tk.Canvas(root, bg="#0f0f13", highlightthickness=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
+
+    # Drag support
+    drag = {"x": 0, "y": 0}
+    def on_drag_start(e):
+        drag["x"] = e.x_root - root.winfo_x()
+        drag["y"] = e.y_root - root.winfo_y()
+    def on_drag_motion(e):
+        root.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
+    title_bar.bind("<ButtonPress-1>", on_drag_start)
+    title_bar.bind("<B1-Motion>", on_drag_motion)
+
+    photo_ref = [None]
+
+    def update_frame():
+        if not state.running:
+            root.destroy()
+            return
+        try:
+            frame = state.frame_queue.get_nowait()
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw > 1 and ch > 1:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img = img.resize((cw, ch), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                photo_ref[0] = photo  # prevent GC
+        except queue.Empty:
+            pass
+        root.after(16, update_frame)  # ~60 fps
+
+    root.after(100, update_frame)
+    root.mainloop()
+
+
+# ── Browser dashboard HTML ────────────────────────────────────────────────────
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GestureMouse — Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f13; --bg2: #1a1a24; --bg3: #1e1e2e;
+      --border: #2a2a3d; --accent: #6c5ce7; --accent-l: #a29bfe;
+      --success: #00cec9; --warn: #fdcb6e; --blue: #74b9ff;
+      --danger: #ff6b6b; --text: #e8e8f0; --muted: #8888a8;
+      --dim: #55556a; --r: 10px;
+    }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif;
+           height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+    /* Header */
+    .hdr { display:flex; align-items:center; justify-content:space-between;
+           padding:10px 24px; background:var(--bg2); border-bottom:1px solid var(--border); }
+    .brand { display:flex; align-items:center; gap:10px; }
+    .brand svg { width:24px; height:24px; color:var(--accent); }
+    .brand h1 { font-size:15px; font-weight:600; }
+    .brand span { color:var(--accent-l); }
+    .pill { display:flex; align-items:center; gap:8px; font-size:12px;
+            padding:5px 14px; border-radius:20px; background:var(--bg3);
+            border:1px solid var(--border); }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--dim);
+           transition:.2s; }
+    .dot.ok  { background:var(--success); box-shadow:0 0 8px rgba(0,206,201,.4); }
+    .dot.err { background:var(--danger);  box-shadow:0 0 8px rgba(255,107,107,.4); }
+
+    /* Layout */
+    .main { flex:1; display:flex; overflow:hidden; }
+    .sidebar { width:260px; background:var(--bg2); border-right:1px solid var(--border);
+               display:flex; flex-direction:column; overflow-y:auto; flex-shrink:0; }
+    .sec { padding:18px 20px; border-bottom:1px solid var(--border); }
+    .sec:last-child { border-bottom:none; }
+    .sec-title { font-size:10px; font-weight:700; text-transform:uppercase;
+                 letter-spacing:1px; color:var(--dim); margin-bottom:12px; }
+
+    /* Gesture items */
+    .g-list { display:flex; flex-direction:column; gap:7px; }
+    .g-item { display:flex; align-items:center; gap:9px; padding:9px 11px;
+              border-radius:8px; background:var(--bg3); border:1px solid var(--border);
+              transition:.2s; }
+    .g-item.on { border-color:var(--accent); box-shadow:0 0 10px rgba(108,92,231,.3); }
+    .g-dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+    .g-dot.lc { background:var(--warn); }
+    .g-dot.rc { background:var(--blue); }
+    .g-dot.sc { background:var(--accent-l); }
+    .g-item.on .g-dot.lc { box-shadow:0 0 7px rgba(253,203,110,.7); }
+    .g-item.on .g-dot.rc { box-shadow:0 0 7px rgba(116,185,255,.7); }
+    .g-item.on .g-dot.sc { box-shadow:0 0 7px rgba(162,155,254,.7); }
+    .g-name { font-size:13px; font-weight:500; }
+    .g-key  { margin-left:auto; font-size:10px; color:var(--dim);
+              padding:2px 7px; border-radius:4px; background:var(--bg); }
+
+    /* Sliders */
+    .ctrl { margin-bottom:14px; }
+    .ctrl:last-child { margin-bottom:0; }
+    .ctrl-hdr { display:flex; justify-content:space-between; margin-bottom:7px; }
+    .ctrl-lbl { font-size:12px; color:var(--muted); }
+    .ctrl-val { font-size:12px; font-weight:600; color:var(--accent-l); }
+    input[type=range] { -webkit-appearance:none; width:100%; height:5px;
+                        border-radius:3px; background:var(--bg); outline:none; cursor:pointer; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px;
+      border-radius:50%; background:var(--accent); border:2px solid var(--bg2);
+      box-shadow:0 0 6px rgba(108,92,231,.4); cursor:pointer; }
+
+    /* Content */
+    .content { flex:1; display:flex; align-items:center; justify-content:center;
+               background:var(--bg); padding:24px; }
+    .center { display:flex; flex-direction:column; align-items:center; gap:18px; text-align:center; }
+    .hero { width:72px; height:72px; border-radius:50%;
+            background:linear-gradient(135deg,var(--accent),var(--accent-l));
+            display:flex; align-items:center; justify-content:center;
+            box-shadow:0 0 36px rgba(108,92,231,.35); }
+    .hero svg { width:36px; height:36px; color:#fff; }
+    .hero-title { font-size:20px; font-weight:600; }
+    .hero-sub { font-size:13px; color:var(--muted); max-width:340px; line-height:1.6; }
+    .stats { display:flex; gap:14px; margin-top:6px; }
+    .stat { background:var(--bg3); border:1px solid var(--border); border-radius:var(--r);
+            padding:14px 22px; text-align:center; min-width:110px; }
+    .stat-v { font-size:22px; font-weight:700; color:var(--accent-l); }
+    .stat-l { font-size:10px; color:var(--dim); text-transform:uppercase;
+              letter-spacing:.5px; margin-top:3px; }
+
+    /* Notice */
+    .notice { background:rgba(108,92,231,.12); border:1px solid rgba(108,92,231,.3);
+              border-radius:var(--r); padding:12px 16px; font-size:12px;
+              color:var(--accent-l); max-width:400px; line-height:1.5; }
+
+    /* Footer */
+    .ftr { padding:7px 24px; background:var(--bg2); border-top:1px solid var(--border);
+           display:flex; justify-content:space-between; font-size:10px; color:var(--dim); }
+  </style>
+</head>
+<body>
+  <header class="hdr">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 11V6a2 2 0 0 0-4 0v0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8"/>
+        <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>
+      </svg>
+      <h1>Gesture<span>Mouse</span></h1>
+    </div>
+    <div class="pill">
+      <div class="dot" id="dot"></div>
+      <span id="statusTxt">Connecting...</span>
+    </div>
+  </header>
+
+  <div class="main">
+    <aside class="sidebar">
+      <div class="sec">
+        <div class="sec-title">Active Gestures</div>
+        <div class="g-list">
+          <div class="g-item" id="gL">
+            <div class="g-dot lc"></div>
+            <span class="g-name">Left Click</span>
+            <span class="g-key">Thumb+Index</span>
+          </div>
+          <div class="g-item" id="gR">
+            <div class="g-dot rc"></div>
+            <span class="g-name">Right Click</span>
+            <span class="g-key">Thumb+Middle</span>
+          </div>
+          <div class="g-item" id="gS">
+            <div class="g-dot sc"></div>
+            <span class="g-name">Scroll</span>
+            <span class="g-key">Thumb+Pinky</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-title">Settings</div>
+        <div class="ctrl">
+          <div class="ctrl-hdr">
+            <span class="ctrl-lbl">Pinch Threshold</span>
+            <span class="ctrl-val" id="threshVal">0.05</span>
+          </div>
+          <input type="range" id="pinchThreshold" min="0.02" max="0.15" step="0.01" value="0.05">
+        </div>
+        <div class="ctrl">
+          <div class="ctrl-hdr">
+            <span class="ctrl-lbl">Smoothing</span>
+            <span class="ctrl-val" id="smoothVal">0.10</span>
+          </div>
+          <input type="range" id="smoothing" min="0.05" max="0.5" step="0.05" value="0.1">
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-title">Performance</div>
+        <div class="stat" style="width:100%">
+          <div class="stat-v" id="fpsVal">--</div>
+          <div class="stat-l">Frames / sec</div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="content">
+      <div class="center">
+        <div class="hero">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 11V6a2 2 0 0 0-4 0v0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8"/>
+            <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>
+          </svg>
+        </div>
+        <h2 class="hero-title">Hand Gesture Mouse Control</h2>
+        <p class="hero-sub">
+          Move your hand in front of the camera to control the cursor.
+          Pinch fingers together to click, right-click, or scroll.
+        </p>
+        <div class="notice">
+          📷 Camera detection runs natively in Python — it stays active even when
+          this browser window is minimized. Look for the floating camera preview window.
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-v" id="gestureCount">0</div>
+            <div class="stat-l">Gestures</div>
+          </div>
+          <div class="stat">
+            <div class="stat-v" id="handStatus">—</div>
+            <div class="stat-l">Hand</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="ftr">
+    <span>MediaPipe · OpenCV · Python Backend</span>
+    <span>v3.0</span>
+  </footer>
+
+  <script>
+    const dot = document.getElementById('dot');
+    const statusTxt = document.getElementById('statusTxt');
+    const gL = document.getElementById('gL');
+    const gR = document.getElementById('gR');
+    const gS = document.getElementById('gS');
+    const fpsVal = document.getElementById('fpsVal');
+    const gestureCount = document.getElementById('gestureCount');
+    const handStatus = document.getElementById('handStatus');
+
+    const pinchSlider = document.getElementById('pinchThreshold');
+    const smoothSlider = document.getElementById('smoothing');
+    const threshVal = document.getElementById('threshVal');
+    const smoothVal = document.getElementById('smoothVal');
+
+    pinchSlider.oninput = () => {
+      threshVal.textContent = parseFloat(pinchSlider.value).toFixed(2);
+      sendSettings();
+    };
+    smoothSlider.oninput = () => {
+      smoothVal.textContent = parseFloat(smoothSlider.value).toFixed(2);
+      sendSettings();
+    };
+
+    let ws, reconnects = 0;
+
+    function connect() {
+      ws = new WebSocket('ws://localhost:8765/ws');
+      ws.onopen = () => {
+        reconnects = 0;
+        dot.className = 'dot ok';
+        statusTxt.textContent = 'Connected';
+        sendSettings();
+      };
+      ws.onclose = () => {
+        dot.className = 'dot err';
+        statusTxt.textContent = 'Reconnecting...';
+        if (reconnects < 10) { reconnects++; setTimeout(connect, 1000 * reconnects); }
+        else statusTxt.textContent = 'Connection failed';
+      };
+      ws.onerror = e => console.error(e);
+      ws.onmessage = msg => {
+        try {
+          const d = JSON.parse(msg.data);
+          if (d.type === 'status') {
+            gL.classList.toggle('on', d.left);
+            gR.classList.toggle('on', d.right);
+            gS.classList.toggle('on', d.scroll);
+            fpsVal.textContent = d.fps;
+            gestureCount.textContent = d.gesture_count;
+            handStatus.textContent = d.hand ? 'YES' : 'NO';
+          }
+        } catch(e) {}
+      };
+    }
+    connect();
+
+    function sendSettings() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'settings',
+          pinch_threshold: parseFloat(pinchSlider.value),
+          smoothing: parseFloat(smoothSlider.value)
+        }));
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+# ── WebSocket handler ─────────────────────────────────────────────────────────
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    with state.lock:
+        state.ws_clients.add(ws)
+    print("Dashboard client connected.")
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    if data.get('type') == 'settings':
+                        with state.lock:
+                            if 'pinch_threshold' in data:
+                                state.pinch_threshold = float(data['pinch_threshold'])
+                            if 'smoothing' in data:
+                                state.smoothing = float(data['smoothing'])
+                except Exception as e:
+                    print(f"WS message error: {e}")
+            elif msg.type == web.WSMsgType.ERROR:
+                print(f"WS error: {ws.exception()}")
+    except Exception as e:
+        print(f"WS connection error: {e}")
+    finally:
+        with state.lock:
+            state.ws_clients.discard(ws)
+        print("Dashboard client disconnected.")
+
+    return ws
+
+
+async def index(request):
+    return web.Response(text=HTML_CONTENT, content_type='text/html')
+
+
+# ── Status broadcast task ─────────────────────────────────────────────────────
+async def broadcast_status():
+    """Push gesture/status updates to all connected dashboard clients."""
+    while True:
+        await asyncio.sleep(0.1)  # 10 Hz
+        with state.lock:
+            clients = set(state.ws_clients)
+            payload = json.dumps({
+                "type": "status",
+                "hand": state.hand_detected,
+                "left": state.gesture_left,
+                "right": state.gesture_right,
+                "scroll": state.gesture_scroll,
+                "fps": state.fps,
+                "gesture_count": state.gesture_count,
+            })
+        for ws in clients:
+            try:
+                await ws.send_str(payload)
+            except Exception:
+                pass
+
+
+# ── Asyncio server (runs in a background thread) ──────────────────────────────
+def open_browser():
+    time.sleep(2.0)
+    webbrowser.open('http://localhost:8765')
+
+
+async def server_main():
+    app_web = web.Application()
+    app_web.router.add_get('/', index)
+    app_web.router.add_get('/ws', websocket_handler)
+
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8765)
+    await site.start()
+
+    asyncio.create_task(broadcast_status())
+
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await runner.cleanup()
+
+
+def run_server_thread():
+    """Run the aiohttp server in a dedicated thread with its own event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server_main())
+    except Exception as e:
+        print(f"Server error: {e}")
+    finally:
+        loop.close()
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 52)
+    print("  GestureMouse v3")
+    print("=" * 52)
+    print(f"  Dashboard : http://localhost:8765")
+    print(f"  Screen    : {screen_width}x{screen_height}")
+    print("  Camera window is always-on-top (native)")
+    print("  Press Ctrl+C to stop")
+    print("=" * 52)
+
+    # Start hand detection in background thread
+    det_thread = threading.Thread(target=hand_detection_thread, daemon=True)
+    det_thread.start()
+
+    # Start aiohttp server in background thread
+    srv_thread = threading.Thread(target=run_server_thread, daemon=True)
+    srv_thread.start()
+
+    # Open browser in background thread
+    threading.Thread(target=open_browser, daemon=True).start()
+
+    # Run tkinter camera window on the MAIN thread (required by Tcl/Tk)
+    try:
+        run_camera_window()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        state.running = False
+        print("\nServer stopped.")
