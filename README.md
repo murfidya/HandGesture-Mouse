@@ -1,4 +1,4 @@
-# GestureMouse v3
+# GestureMouse
 
 Control your mouse cursor with hand gestures using your webcam — no extra hardware needed.
 
@@ -34,8 +34,8 @@ Control your mouse cursor with hand gestures using your webcam — no extra hard
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/gesture-mouse.git
-cd gesture-mouse
+git clone https://github.com/murfidya/HandGesture-Mouse.git
+cd HandGesture-Mouse
 
 # 2. (Optional) Create a virtual environment
 python -m venv venv
