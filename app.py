@@ -9,6 +9,7 @@ Hand Gesture Mouse Control - v3
 Usage: python app.py
 """
 
+import argparse
 import asyncio
 import json
 import threading
@@ -55,13 +56,19 @@ class AppState:
 
         # Settings (can be updated from browser)
         self.pinch_threshold = 0.05
-        self.smoothing = 0.1
-        self.hand_range_min = 0.3
-        self.hand_range_max = 0.7
+        self.smoothing = 0.3          # higher = more responsive, lower = smoother
+        self.sensitivity = 1.0        # 0.5 = big hand moves, 2.0 = tiny hand moves
+
+        # Derived hand range (recomputed when sensitivity changes)
+        self._base_center = 0.5
+        self._base_half = 0.2         # default range is 0.3–0.7
+        self._update_hand_range()
 
         # Mouse state
         self.curr_x = screen_width // 2
         self.curr_y = screen_height // 2
+        self.vel_x = 0.0              # velocity for smoothing
+        self.vel_y = 0.0
         self.last_left = False
         self.last_right = False
         self.last_scroll = False
@@ -85,6 +92,12 @@ class AppState:
 
         # WebSocket clients for broadcasting status
         self.ws_clients = set()
+
+    def _update_hand_range(self):
+        """Recompute hand_range_min/max from sensitivity."""
+        half = self._base_half / max(self.sensitivity, 0.1)
+        self.hand_range_min = max(0.0, self._base_center - half)
+        self.hand_range_max = min(1.0, self._base_center + half)
 
 state = AppState()
 
@@ -202,12 +215,18 @@ def draw_hand_skeleton(frame, landmarks):
 # ── Hand detection thread ─────────────────────────────────────────────────────
 def hand_detection_thread():
     cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("ERROR: Could not open camera!")
+        state.running = False
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize capture buffer lag
 
     frame_count = 0
+    fail_count = 0
     fps_timer = time.time()
     fps = 0
 
@@ -224,7 +243,13 @@ def hand_detection_thread():
         while state.running:
             ret, frame = cap.read()
             if not ret:
-                continue  # no sleep — retry immediately to avoid frame-rate stall
+                fail_count += 1
+                if fail_count > 60:
+                    print("ERROR: Camera disconnected or unavailable!")
+                    state.running = False
+                    break
+                continue
+            fail_count = 0
 
             frame_count += 1
             now = time.time()
@@ -299,8 +324,15 @@ def hand_detection_thread():
                 with state.lock:
                     target_x = x * screen_width
                     target_y = y * screen_height
-                    state.curr_x += (target_x - state.curr_x) * smoothing
-                    state.curr_y += (target_y - state.curr_y) * smoothing
+
+                    # Velocity-dampened smoothing for fluid motion
+                    dx = target_x - state.curr_x
+                    dy = target_y - state.curr_y
+                    state.vel_x = state.vel_x * (1 - smoothing) + dx * smoothing
+                    state.vel_y = state.vel_y * (1 - smoothing) + dy * smoothing
+                    state.curr_x += state.vel_x
+                    state.curr_y += state.vel_y
+
                     state.curr_x = max(0, min(state.curr_x, screen_width - 1))
                     state.curr_y = max(0, min(state.curr_y, screen_height - 1))
                     cx, cy = int(state.curr_x), int(state.curr_y)
@@ -338,9 +370,15 @@ def hand_detection_thread():
                     state.last_scroll = is_scroll
 
             else:
+                # Release mouse button if it was held (hand left frame while clicking)
                 with state.lock:
+                    was_left = state.last_left
                     state.last_left = state.last_right = state.last_scroll = False
                     state.smooth_scroll_y = None
+                    state.vel_x = 0.0
+                    state.vel_y = 0.0
+                if was_left:
+                    pyautogui.mouseUp()
 
             with state.lock:
                 state.hand_detected  = hand_detected
@@ -422,6 +460,14 @@ def run_camera_window():
         root.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
     title_bar.bind("<ButtonPress-1>", on_drag_start)
     title_bar.bind("<B1-Motion>", on_drag_motion)
+
+    # Clean exit handlers (Escape key or window close button)
+    def on_close():
+        state.running = False
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.bind("<Escape>", lambda e: on_close())
 
     photo_ref = [None]
 
@@ -599,9 +645,16 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="ctrl">
           <div class="ctrl-hdr">
             <span class="ctrl-lbl">Smoothing</span>
-            <span class="ctrl-val" id="smoothVal">0.10</span>
+            <span class="ctrl-val" id="smoothVal">0.30</span>
           </div>
-          <input type="range" id="smoothing" min="0.05" max="0.5" step="0.05" value="0.1">
+          <input type="range" id="smoothing" min="0.05" max="0.5" step="0.05" value="0.3">
+        </div>
+        <div class="ctrl">
+          <div class="ctrl-hdr">
+            <span class="ctrl-lbl">Sensitivity</span>
+            <span class="ctrl-val" id="sensVal">1.00</span>
+          </div>
+          <input type="range" id="sensitivity" min="0.5" max="2.5" step="0.1" value="1.0">
         </div>
       </div>
 
@@ -663,8 +716,10 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     const pinchSlider = document.getElementById('pinchThreshold');
     const smoothSlider = document.getElementById('smoothing');
+    const sensSlider = document.getElementById('sensitivity');
     const threshVal = document.getElementById('threshVal');
     const smoothVal = document.getElementById('smoothVal');
+    const sensVal = document.getElementById('sensVal');
 
     pinchSlider.oninput = () => {
       threshVal.textContent = parseFloat(pinchSlider.value).toFixed(2);
@@ -672,6 +727,10 @@ HTML_CONTENT = """<!DOCTYPE html>
     };
     smoothSlider.oninput = () => {
       smoothVal.textContent = parseFloat(smoothSlider.value).toFixed(2);
+      sendSettings();
+    };
+    sensSlider.oninput = () => {
+      sensVal.textContent = parseFloat(sensSlider.value).toFixed(2);
       sendSettings();
     };
 
@@ -713,7 +772,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         ws.send(JSON.stringify({
           type: 'settings',
           pinch_threshold: parseFloat(pinchSlider.value),
-          smoothing: parseFloat(smoothSlider.value)
+          smoothing: parseFloat(smoothSlider.value),
+          sensitivity: parseFloat(sensSlider.value)
         }));
       }
     }
@@ -743,6 +803,9 @@ async def websocket_handler(request):
                                 state.pinch_threshold = float(data['pinch_threshold'])
                             if 'smoothing' in data:
                                 state.smoothing = float(data['smoothing'])
+                            if 'sensitivity' in data:
+                                state.sensitivity = float(data['sensitivity'])
+                                state._update_hand_range()
                 except Exception as e:
                     print(f"WS message error: {e}")
             elif msg.type == web.WSMsgType.ERROR:
@@ -824,13 +887,18 @@ def run_server_thread():
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GestureMouse — Hand Gesture Mouse Control")
+    parser.add_argument('--no-browser', action='store_true',
+                        help='Do not auto-open the dashboard in the browser')
+    args = parser.parse_args()
+
     print("=" * 52)
     print("  GestureMouse v3")
     print("=" * 52)
     print(f"  Dashboard : http://localhost:8765")
     print(f"  Screen    : {screen_width}x{screen_height}")
     print("  Camera window is always-on-top (native)")
-    print("  Press Ctrl+C to stop")
+    print("  Press Ctrl+C or Esc to stop")
     print("=" * 52)
 
     # Start hand detection in background thread
@@ -841,8 +909,9 @@ if __name__ == "__main__":
     srv_thread = threading.Thread(target=run_server_thread, daemon=True)
     srv_thread.start()
 
-    # Open browser in background thread
-    threading.Thread(target=open_browser, daemon=True).start()
+    # Open browser in background thread (unless --no-browser)
+    if not args.no_browser:
+        threading.Thread(target=open_browser, daemon=True).start()
 
     # Run tkinter camera window on the MAIN thread (required by Tcl/Tk)
     try:
