@@ -48,6 +48,60 @@ if not os.path.exists(MODEL_PATH):
     )
     print("Model downloaded.")
 
+# ── One Euro Filter (jitter removal) ─────────────────────────────────────────
+class LowPassFilter:
+    """Simple exponential low-pass filter."""
+    def __init__(self, alpha=1.0):
+        self.y = None
+        self.alpha = alpha
+
+    def __call__(self, value, alpha=None):
+        if alpha is not None:
+            self.alpha = alpha
+        if self.y is None:
+            self.y = value
+        else:
+            self.y = self.alpha * value + (1 - self.alpha) * self.y
+        return self.y
+
+    def reset(self):
+        self.y = None
+
+
+class OneEuroFilter:
+    """One Euro Filter — speed-adaptive jitter reduction.
+    Low min_cutoff = smoother when still.  High beta = more responsive to fast moves."""
+    def __init__(self, freq=60.0, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_filter = LowPassFilter()
+        self.dx_filter = LowPassFilter()
+        self.last_time = None
+
+    def _alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / te)
+
+    def __call__(self, x, t=None):
+        if self.last_time is not None and t is not None:
+            self.freq = 1.0 / max(t - self.last_time, 1e-9)
+        self.last_time = t
+
+        prev = self.x_filter.y
+        dx = 0.0 if prev is None else (x - prev) * self.freq
+        edx = self.dx_filter(dx, self._alpha(self.d_cutoff))
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        return self.x_filter(x, self._alpha(cutoff))
+
+    def reset(self):
+        self.x_filter.reset()
+        self.dx_filter.reset()
+        self.last_time = None
+
+
 # ── Shared state (thread-safe via simple primitives) ──────────────────────────
 class AppState:
     def __init__(self):
@@ -56,7 +110,7 @@ class AppState:
 
         # Settings (can be updated from browser)
         self.pinch_threshold = 0.05
-        self.smoothing = 0.3          # higher = more responsive, lower = smoother
+        self.smoothing = 0.3          # controls One Euro Filter min_cutoff
         self.sensitivity = 1.0        # 0.5 = big hand moves, 2.0 = tiny hand moves
 
         # Derived hand range (recomputed when sensitivity changes)
@@ -64,11 +118,14 @@ class AppState:
         self._base_half = 0.2         # default range is 0.3–0.7
         self._update_hand_range()
 
-        # Mouse state
-        self.curr_x = screen_width // 2
-        self.curr_y = screen_height // 2
-        self.vel_x = 0.0              # velocity for smoothing
-        self.vel_y = 0.0
+        # Target position from detection thread (raw, before filtering)
+        self.target_x = screen_width / 2.0
+        self.target_y = screen_height / 2.0
+
+        # Actual cursor position (updated by cursor thread at 60fps)
+        self.curr_x = screen_width / 2.0
+        self.curr_y = screen_height / 2.0
+
         self.last_left = False
         self.last_right = False
         self.last_scroll = False
@@ -317,31 +374,19 @@ def hand_detection_thread():
                              (int(pnk_tip.x * w_px),   int(pnk_tip.y * h_px)),
                              SCROLL_COLOR, 3, cv2.LINE_AA)
 
-                # ── Mouse control ─────────────────────────────────────────────
+                # ── Set target for cursor thread ─────────────────────────────
                 x = remap(wrist.x, rmin, rmax)
                 y = remap(wrist.y, rmin, rmax)
 
                 with state.lock:
-                    target_x = x * screen_width
-                    target_y = y * screen_height
-
-                    # Velocity-dampened smoothing for fluid motion
-                    dx = target_x - state.curr_x
-                    dy = target_y - state.curr_y
-                    state.vel_x = state.vel_x * (1 - smoothing) + dx * smoothing
-                    state.vel_y = state.vel_y * (1 - smoothing) + dy * smoothing
-                    state.curr_x += state.vel_x
-                    state.curr_y += state.vel_y
-
-                    state.curr_x = max(0, min(state.curr_x, screen_width - 1))
-                    state.curr_y = max(0, min(state.curr_y, screen_height - 1))
-                    cx, cy = int(state.curr_x), int(state.curr_y)
-                    last_left   = state.last_left
-                    last_right  = state.last_right
+                    state.target_x = x * screen_width
+                    state.target_y = y * screen_height
                     last_scroll = state.last_scroll
-                    smooth_scroll_y = state.smooth_scroll_y
 
+                # Scroll is still handled here (doesn't need 60fps)
                 if is_scroll:
+                    with state.lock:
+                        smooth_scroll_y = state.smooth_scroll_y
                     if smooth_scroll_y is None or not last_scroll:
                         smooth_scroll_y = y
                     else:
@@ -352,14 +397,6 @@ def hand_detection_thread():
                             pyautogui.scroll(int(delta))
                     with state.lock:
                         state.smooth_scroll_y = smooth_scroll_y
-                else:
-                    pyautogui.moveTo(cx, cy)
-                    if is_left and not last_left:
-                        pyautogui.mouseDown()
-                    elif not is_left and last_left:
-                        pyautogui.mouseUp()
-                    if is_right and not last_right:
-                        pyautogui.click(button='right')
 
                 with state.lock:
                     if is_left and not state.last_left:    state.gesture_count += 1
@@ -375,8 +412,6 @@ def hand_detection_thread():
                     was_left = state.last_left
                     state.last_left = state.last_right = state.last_scroll = False
                     state.smooth_scroll_y = None
-                    state.vel_x = 0.0
-                    state.vel_y = 0.0
                 if was_left:
                     pyautogui.mouseUp()
 
@@ -401,6 +436,63 @@ def hand_detection_thread():
                 pass
 
     cap.release()
+
+
+# ── 60fps cursor update thread ────────────────────────────────────────────────
+def cursor_update_thread():
+    """Runs at ~60 Hz, applies One Euro Filter, and moves the cursor.
+    Decoupled from camera frame rate for fluid motion."""
+    filter_x = OneEuroFilter(freq=60.0, min_cutoff=1.5, beta=0.01)
+    filter_y = OneEuroFilter(freq=60.0, min_cutoff=1.5, beta=0.01)
+    interval = 1.0 / 60.0  # ~16.67 ms
+
+    while state.running:
+        t = time.time()
+
+        with state.lock:
+            hand = state.hand_detected
+            tx = state.target_x
+            ty = state.target_y
+            is_left = state.gesture_left
+            is_right = state.gesture_right
+            is_scroll = state.gesture_scroll
+            last_left = state.last_left
+            last_right = state.last_right
+            smoothing = state.smoothing
+
+        if hand and not is_scroll:
+            # Update filter min_cutoff from smoothing slider
+            # smoothing 0.05→0.5 maps to min_cutoff 3.0→0.3 (lower = smoother)
+            mc = max(0.3, 3.0 - smoothing * 6.0)
+            filter_x.min_cutoff = mc
+            filter_y.min_cutoff = mc
+
+            fx = filter_x(tx, t)
+            fy = filter_y(ty, t)
+            fx = max(0, min(fx, screen_width - 1))
+            fy = max(0, min(fy, screen_height - 1))
+
+            with state.lock:
+                state.curr_x = fx
+                state.curr_y = fy
+
+            pyautogui.moveTo(int(fx), int(fy))
+
+            # Click handling
+            if is_left and not last_left:
+                pyautogui.mouseDown()
+            elif not is_left and last_left:
+                pyautogui.mouseUp()
+            if is_right and not last_right:
+                pyautogui.click(button='right')
+        else:
+            filter_x.reset()
+            filter_y.reset()
+
+        elapsed = time.time() - t
+        sleep_time = interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 # ── Always-on-top tkinter camera window ──────────────────────────────────────
@@ -904,6 +996,10 @@ if __name__ == "__main__":
     # Start hand detection in background thread
     det_thread = threading.Thread(target=hand_detection_thread, daemon=True)
     det_thread.start()
+
+    # Start 60fps cursor update thread
+    cur_thread = threading.Thread(target=cursor_update_thread, daemon=True)
+    cur_thread.start()
 
     # Start aiohttp server in background thread
     srv_thread = threading.Thread(target=run_server_thread, daemon=True)
