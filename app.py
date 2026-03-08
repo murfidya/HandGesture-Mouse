@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hand Gesture Mouse Control - v3
+Hand Gesture Mouse Control - v1.0.0
 - Hand detection runs entirely in Python (OpenCV + MediaPipe)
 - Always-on-top floating camera window (tkinter) stays visible even when browser is minimized
 - WebSocket server sends mouse commands to pyautogui
@@ -446,6 +446,10 @@ def cursor_update_thread():
     filter_y = OneEuroFilter(freq=60.0, min_cutoff=1.5, beta=0.01)
     interval = 1.0 / 60.0  # ~16.67 ms
 
+    # Track previous click state LOCALLY to detect edges correctly
+    prev_left = False
+    prev_right = False
+
     while state.running:
         t = time.time()
 
@@ -456,8 +460,6 @@ def cursor_update_thread():
             is_left = state.gesture_left
             is_right = state.gesture_right
             is_scroll = state.gesture_scroll
-            last_left = state.last_left
-            last_right = state.last_right
             smoothing = state.smoothing
 
         if hand and not is_scroll:
@@ -478,14 +480,22 @@ def cursor_update_thread():
 
             pyautogui.moveTo(int(fx), int(fy))
 
-            # Click handling
-            if is_left and not last_left:
+            # Click handling (edge detection using local prev state)
+            if is_left and not prev_left:
                 pyautogui.mouseDown()
-            elif not is_left and last_left:
+            elif not is_left and prev_left:
                 pyautogui.mouseUp()
-            if is_right and not last_right:
+            if is_right and not prev_right:
                 pyautogui.click(button='right')
+
+            prev_left = is_left
+            prev_right = is_right
         else:
+            # Release mouse if hand disappeared while clicking
+            if prev_left:
+                pyautogui.mouseUp()
+            prev_left = False
+            prev_right = False
             filter_x.reset()
             filter_y.reset()
 
