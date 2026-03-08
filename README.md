@@ -16,7 +16,9 @@ Control your mouse cursor with hand gestures using your webcam — no extra hard
 - 🔄 **Scroll** — pinch Thumb + Pinky finger and move hand up/down
 - 📷 **Always-on-top camera window** — native floating preview stays visible even when the browser is minimized
 - 🌐 **Web dashboard** — real-time gesture indicators, FPS counter, and adjustable settings
-- ⚡ **60 FPS target** — uses MediaPipe Tasks VIDEO mode for fast tracking
+- ⚡ **60 FPS cursor** — dedicated cursor thread runs at 60 Hz, decoupled from camera frame rate
+- 🎛️ **One Euro Filter** — adaptive smoothing that reduces jitter while keeping responsiveness
+- 🎯 **Sensitivity control** — adjustable cursor sensitivity via dashboard
 
 ---
 
@@ -59,9 +61,15 @@ python app.py
 - Your browser will open the dashboard at `http://localhost:8765`
 - Move your hand in front of the camera to start controlling the mouse
 
+To launch without auto-opening the browser:
+
+```bash
+python app.py --no-browser
+```
+
 ### Stopping
 
-Press `Ctrl+C` in the terminal, or close the camera window.
+Press `Escape`, close the camera window, or press `Ctrl+C` in the terminal.
 
 ---
 
@@ -81,7 +89,8 @@ Press `Ctrl+C` in the terminal, or close the camera window.
 | Setting | Description | Default |
 |---|---|---|
 | Pinch Threshold | How close fingers must be to trigger a pinch | 0.05 |
-| Smoothing | Cursor movement smoothing (lower = smoother but slower) | 0.10 |
+| Smoothing | Controls the One Euro Filter cutoff (lower = smoother) | 0.30 |
+| Sensitivity | Cursor movement multiplier (higher = faster) | 1.00 |
 
 ---
 
@@ -90,8 +99,9 @@ Press `Ctrl+C` in the terminal, or close the camera window.
 ```
 Main thread      → tkinter always-on-top camera window
 Thread-1         → hand_detection_thread (OpenCV + MediaPipe Tasks API)
-Thread-2         → aiohttp HTTP + WebSocket server
-Thread-3         → browser auto-open
+Thread-2         → cursor_update_thread (60 Hz One Euro Filter + pyautogui)
+Thread-3         → aiohttp HTTP + WebSocket server
+Thread-4         → browser auto-open
 ```
 
 Detection runs entirely in Python — the browser is only used as a settings dashboard and is **not required** for the mouse control to work.
@@ -108,6 +118,19 @@ Detection runs entirely in Python — the browser is only used as a settings das
 | `aiohttp` | HTTP + WebSocket server |
 | `Pillow` | Frame rendering in tkinter window |
 | `tkinter` | Always-on-top native camera window (stdlib) |
+
+---
+
+## What's New (v1.1.0)
+
+- **One Euro Filter** — replaced velocity-dampened smoothing with adaptive jitter reduction
+- **60 FPS cursor thread** — cursor updates at 60 Hz, independent of camera frame rate
+- **Sensitivity slider** — adjust cursor speed from the dashboard
+- **Dashboard redesign** — centered card-grid layout with glassmorphism, animations, and Inter font
+- **`--no-browser` flag** — launch without auto-opening the dashboard
+- **Mouse-up fix** — mouse button releases correctly when hand leaves the frame mid-click
+- **Camera failure handling** — graceful exit on webcam disconnection
+- **Clean exit** — press Escape or close the camera window to quit
 
 ---
 
