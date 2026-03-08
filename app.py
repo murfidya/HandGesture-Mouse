@@ -442,8 +442,8 @@ def hand_detection_thread():
 def cursor_update_thread():
     """Runs at ~60 Hz, applies One Euro Filter, and moves the cursor.
     Decoupled from camera frame rate for fluid motion."""
-    filter_x = OneEuroFilter(freq=60.0, min_cutoff=0.7, beta=0.005)
-    filter_y = OneEuroFilter(freq=60.0, min_cutoff=0.7, beta=0.005)
+    filter_x = OneEuroFilter(freq=60.0, min_cutoff=1.5, beta=0.01)
+    filter_y = OneEuroFilter(freq=60.0, min_cutoff=1.5, beta=0.01)
     interval = 1.0 / 60.0  # ~16.67 ms
 
     # Track previous click state LOCALLY to detect edges correctly
@@ -464,8 +464,8 @@ def cursor_update_thread():
 
         if hand and not is_scroll:
             # Update filter min_cutoff from smoothing slider
-            # smoothing 0.05→0.5 maps to min_cutoff 1.5→0.1 (lower = smoother)
-            mc = max(0.1, 1.5 - smoothing * 3.0)
+            # smoothing 0.05→0.5 maps to min_cutoff 3.0→0.3 (lower = smoother)
+            mc = max(0.3, 3.0 - smoothing * 6.0)
             filter_x.min_cutoff = mc
             filter_y.min_cutoff = mc
 
