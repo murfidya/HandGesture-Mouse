@@ -669,32 +669,68 @@ HTML_CONTENT = """<!DOCTYPE html>
     .dot.err { background: var(--danger); box-shadow: 0 0 10px rgba(248,113,113,0.5); }
 
     /* Layout */
-    .main { flex: 1; display: flex; overflow: hidden; position: relative; z-index: 1; }
-
-    .sidebar {
-      width: 280px; background: var(--bg2); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0;
-      backdrop-filter: blur(12px);
+    .main {
+      flex: 1; display: flex; align-items: flex-start; justify-content: center;
+      overflow-y: auto; position: relative; z-index: 1;
+      padding: 40px 24px;
     }
-    .sec { padding: 20px 22px; border-bottom: 1px solid var(--border); }
-    .sec:last-child { border-bottom: none; }
-    .sec-title {
+
+    .dashboard {
+      width: 100%; max-width: 820px;
+      display: flex; flex-direction: column; gap: 24px;
+      animation: fadeIn 0.6s ease-out;
+    }
+
+    /* Hero banner */
+    .hero-banner {
+      display: flex; align-items: center; gap: 24px;
+      background: var(--card); border: 1px solid var(--card-border);
+      border-radius: 16px; padding: 28px 32px;
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      width: 64px; height: 64px; border-radius: 50%; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--accent), #9f6cf0, var(--accent-l));
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 0 40px var(--accent-glow);
+      animation: heroFloat 4s ease-in-out infinite;
+      position: relative;
+    }
+    .hero::before {
+      content: ''; position: absolute; inset: -3px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), transparent, var(--accent-l));
+      opacity: 0.3; filter: blur(6px);
+    }
+    .hero svg { width: 30px; height: 30px; color: #fff; position: relative; z-index: 1; }
+    .hero-text { flex: 1; }
+    .hero-title { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 6px; }
+    .hero-sub { font-size: 13px; color: var(--muted); line-height: 1.6; font-weight: 300; }
+
+    /* Two-column grid */
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+
+    /* Cards */
+    .card {
+      background: var(--card); border: 1px solid var(--card-border);
+      border-radius: 14px; padding: 22px 24px;
+      backdrop-filter: blur(10px);
+    }
+    .card-title {
       font-size: 10px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 1.5px; color: var(--dim); margin-bottom: 14px;
+      letter-spacing: 1.5px; color: var(--dim); margin-bottom: 16px;
     }
 
     /* Gesture cards */
     .g-list { display: flex; flex-direction: column; gap: 8px; }
     .g-item {
       display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-      border-radius: 10px; background: var(--card); border: 1px solid var(--card-border);
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      backdrop-filter: blur(8px); cursor: default;
+      border-radius: 10px; background: rgba(8,8,14,0.4); border: 1px solid var(--card-border);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); cursor: default;
     }
-    .g-item:hover { background: rgba(30,30,50,0.7); transform: translateX(3px); }
+    .g-item:hover { background: rgba(30,30,50,0.5); transform: translateX(3px); }
     .g-item.on {
       border-color: var(--accent); background: rgba(124,108,240,0.1);
-      box-shadow: 0 0 20px rgba(124,108,240,0.15), inset 0 0 20px rgba(124,108,240,0.05);
+      box-shadow: 0 0 20px rgba(124,108,240,0.12), inset 0 0 20px rgba(124,108,240,0.05);
       transform: translateX(3px);
     }
     .g-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
@@ -713,6 +749,20 @@ HTML_CONTENT = """<!DOCTYPE html>
       letter-spacing: 0.3px; text-transform: uppercase;
     }
 
+    /* Stats row */
+    .stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+    .stat {
+      background: rgba(8,8,14,0.4); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 14px 16px; text-align: center;
+      transition: all 0.3s ease;
+    }
+    .stat:hover { border-color: var(--accent); transform: translateY(-2px);
+                  box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
+    .stat-v { font-size: 24px; font-weight: 800; color: var(--accent-l);
+              font-variant-numeric: tabular-nums; }
+    .stat-l { font-size: 9px; color: var(--dim); text-transform: uppercase;
+              letter-spacing: 1px; margin-top: 3px; font-weight: 600; }
+
     /* Sliders */
     .ctrl { margin-bottom: 16px; }
     .ctrl:last-child { margin-bottom: 0; }
@@ -723,7 +773,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     input[type=range] {
       -webkit-appearance: none; width: 100%; height: 4px;
-      border-radius: 4px; background: var(--bg); outline: none; cursor: pointer;
+      border-radius: 4px; background: rgba(8,8,14,0.6); outline: none; cursor: pointer;
       transition: background 0.2s;
     }
     input[type=range]:hover { background: #1a1a2a; }
@@ -738,66 +788,17 @@ HTML_CONTENT = """<!DOCTYPE html>
       transform: scale(1.2); box-shadow: 0 0 16px var(--accent-glow);
     }
 
-    /* Content area */
-    .content {
-      flex: 1; display: flex; align-items: center; justify-content: center;
-      background: var(--bg); padding: 32px; position: relative;
-    }
+    /* Performance card */
+    .perf-stat { text-align: center; padding: 18px 0; }
+    .perf-stat .stat-v { font-size: 36px; }
 
-    .center {
-      display: flex; flex-direction: column; align-items: center;
-      gap: 24px; text-align: center;
-      animation: fadeIn 0.8s ease-out;
-    }
-
-    .hero {
-      width: 88px; height: 88px; border-radius: 50%;
-      background: linear-gradient(135deg, var(--accent), #9f6cf0, var(--accent-l));
-      display: flex; align-items: center; justify-content: center;
-      box-shadow: 0 0 50px var(--accent-glow), 0 0 100px rgba(124,108,240,0.15);
-      animation: heroFloat 4s ease-in-out infinite;
-      position: relative;
-    }
-    .hero::before {
-      content: ''; position: absolute; inset: -4px; border-radius: 50%;
-      background: linear-gradient(135deg, var(--accent), transparent, var(--accent-l));
-      opacity: 0.3; filter: blur(8px);
-    }
-    .hero svg { width: 40px; height: 40px; color: #fff; position: relative; z-index: 1;
-                filter: drop-shadow(0 2px 8px rgba(0,0,0,0.3)); }
-
-    .hero-title { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
-    .hero-sub { font-size: 14px; color: var(--muted); max-width: 380px; line-height: 1.7;
-                font-weight: 300; }
-
-    .stats { display: flex; gap: 16px; margin-top: 8px; }
-    .stat {
-      background: var(--card); border: 1px solid var(--card-border);
-      border-radius: var(--r); padding: 18px 28px; text-align: center;
-      min-width: 120px; backdrop-filter: blur(8px);
-      transition: all 0.3s ease;
-    }
-    .stat:hover { border-color: var(--accent); transform: translateY(-2px);
-                  box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
-    .stat-v { font-size: 26px; font-weight: 800; color: var(--accent-l);
-              font-variant-numeric: tabular-nums; }
-    .stat-l { font-size: 10px; color: var(--dim); text-transform: uppercase;
-              letter-spacing: 1px; margin-top: 4px; font-weight: 600; }
-
+    /* Notice */
     .notice {
       background: var(--card); border: 1px solid var(--card-border);
-      border-radius: var(--r); padding: 14px 20px; font-size: 13px;
-      color: var(--muted); max-width: 420px; line-height: 1.6;
-      backdrop-filter: blur(8px); font-weight: 300;
+      border-radius: 12px; padding: 14px 20px; font-size: 12px;
+      color: var(--muted); line-height: 1.6; backdrop-filter: blur(8px);
+      font-weight: 300; text-align: center;
     }
-
-    /* Performance sidebar stat */
-    .perf-card {
-      width: 100%; background: var(--card); border: 1px solid var(--card-border);
-      border-radius: 10px; padding: 18px; text-align: center;
-      backdrop-filter: blur(8px);
-    }
-    .perf-card .stat-v { font-size: 28px; font-weight: 800; }
 
     /* Footer */
     .ftr {
@@ -830,64 +831,10 @@ HTML_CONTENT = """<!DOCTYPE html>
   </header>
 
   <div class="main">
-    <aside class="sidebar">
-      <div class="sec">
-        <div class="sec-title">Active Gestures</div>
-        <div class="g-list">
-          <div class="g-item" id="gL">
-            <div class="g-dot lc"></div>
-            <span class="g-name">Left Click</span>
-            <span class="g-key">Thumb + Index</span>
-          </div>
-          <div class="g-item" id="gR">
-            <div class="g-dot rc"></div>
-            <span class="g-name">Right Click</span>
-            <span class="g-key">Thumb + Middle</span>
-          </div>
-          <div class="g-item" id="gS">
-            <div class="g-dot sc"></div>
-            <span class="g-name">Scroll</span>
-            <span class="g-key">Thumb + Pinky</span>
-          </div>
-        </div>
-      </div>
+    <div class="dashboard">
 
-      <div class="sec">
-        <div class="sec-title">Settings</div>
-        <div class="ctrl">
-          <div class="ctrl-hdr">
-            <span class="ctrl-lbl">Pinch Threshold</span>
-            <span class="ctrl-val" id="threshVal">0.05</span>
-          </div>
-          <input type="range" id="pinchThreshold" min="0.02" max="0.15" step="0.01" value="0.05">
-        </div>
-        <div class="ctrl">
-          <div class="ctrl-hdr">
-            <span class="ctrl-lbl">Smoothing</span>
-            <span class="ctrl-val" id="smoothVal">0.30</span>
-          </div>
-          <input type="range" id="smoothing" min="0.05" max="0.5" step="0.05" value="0.3">
-        </div>
-        <div class="ctrl">
-          <div class="ctrl-hdr">
-            <span class="ctrl-lbl">Sensitivity</span>
-            <span class="ctrl-val" id="sensVal">1.00</span>
-          </div>
-          <input type="range" id="sensitivity" min="0.5" max="2.5" step="0.1" value="1.0">
-        </div>
-      </div>
-
-      <div class="sec">
-        <div class="sec-title">Performance</div>
-        <div class="perf-card">
-          <div class="stat-v" id="fpsVal">--</div>
-          <div class="stat-l">Frames / sec</div>
-        </div>
-      </div>
-    </aside>
-
-    <div class="content">
-      <div class="center">
+      <!-- Hero banner -->
+      <div class="hero-banner">
         <div class="hero">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                stroke-linecap="round" stroke-linejoin="round">
@@ -895,26 +842,95 @@ HTML_CONTENT = """<!DOCTYPE html>
             <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>
           </svg>
         </div>
-        <h2 class="hero-title">Hand Gesture Mouse Control</h2>
-        <p class="hero-sub">
-          Move your hand in front of the camera to control the cursor.
-          Pinch fingers together to click, right-click, or scroll.
-        </p>
-        <div class="notice">
-          📷 Camera detection runs natively in Python — it stays active even when
-          this browser window is minimized. Look for the floating camera preview.
-        </div>
-        <div class="stats">
-          <div class="stat">
-            <div class="stat-v" id="gestureCount">0</div>
-            <div class="stat-l">Gestures</div>
-          </div>
-          <div class="stat">
-            <div class="stat-v" id="handStatus">—</div>
-            <div class="stat-l">Hand</div>
-          </div>
+        <div class="hero-text">
+          <h2 class="hero-title">Hand Gesture Mouse Control</h2>
+          <p class="hero-sub">
+            Move your hand in front of the camera to control the cursor.
+            Pinch fingers together to click, right-click, or scroll.
+          </p>
         </div>
       </div>
+
+      <!-- Two-column grid -->
+      <div class="grid">
+
+        <!-- Left column: Gestures + Stats -->
+        <div style="display:flex; flex-direction:column; gap:20px;">
+          <div class="card">
+            <div class="card-title">Active Gestures</div>
+            <div class="g-list">
+              <div class="g-item" id="gL">
+                <div class="g-dot lc"></div>
+                <span class="g-name">Left Click</span>
+                <span class="g-key">Thumb + Index</span>
+              </div>
+              <div class="g-item" id="gR">
+                <div class="g-dot rc"></div>
+                <span class="g-name">Right Click</span>
+                <span class="g-key">Thumb + Middle</span>
+              </div>
+              <div class="g-item" id="gS">
+                <div class="g-dot sc"></div>
+                <span class="g-name">Scroll</span>
+                <span class="g-key">Thumb + Pinky</span>
+              </div>
+            </div>
+            <div class="stats-row">
+              <div class="stat">
+                <div class="stat-v" id="gestureCount">0</div>
+                <div class="stat-l">Gestures</div>
+              </div>
+              <div class="stat">
+                <div class="stat-v" id="handStatus">—</div>
+                <div class="stat-l">Hand</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right column: Settings + Performance -->
+        <div style="display:flex; flex-direction:column; gap:20px;">
+          <div class="card">
+            <div class="card-title">Settings</div>
+            <div class="ctrl">
+              <div class="ctrl-hdr">
+                <span class="ctrl-lbl">Pinch Threshold</span>
+                <span class="ctrl-val" id="threshVal">0.05</span>
+              </div>
+              <input type="range" id="pinchThreshold" min="0.02" max="0.15" step="0.01" value="0.05">
+            </div>
+            <div class="ctrl">
+              <div class="ctrl-hdr">
+                <span class="ctrl-lbl">Smoothing</span>
+                <span class="ctrl-val" id="smoothVal">0.30</span>
+              </div>
+              <input type="range" id="smoothing" min="0.05" max="0.5" step="0.05" value="0.3">
+            </div>
+            <div class="ctrl">
+              <div class="ctrl-hdr">
+                <span class="ctrl-lbl">Sensitivity</span>
+                <span class="ctrl-val" id="sensVal">1.00</span>
+              </div>
+              <input type="range" id="sensitivity" min="0.5" max="2.5" step="0.1" value="1.0">
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">Performance</div>
+            <div class="perf-stat">
+              <div class="stat-v" id="fpsVal">--</div>
+              <div class="stat-l">Frames / sec</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Notice -->
+      <div class="notice">
+        📷 Camera detection runs natively in Python — it stays active even when this browser window is minimized.
+      </div>
+
     </div>
   </div>
 
