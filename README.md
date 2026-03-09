@@ -4,7 +4,7 @@ Control your mouse cursor with hand gestures using your webcam — no extra hard
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
 ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10%2B-green)
-![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?logo=windows)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-lightgrey?logo=apple)
 
 ---
 
@@ -26,9 +26,11 @@ Control your mouse cursor with hand gestures using your webcam — no extra hard
 
 - Python 3.9+
 - Webcam
-- Windows (tested on Windows 11)
+- Windows (tested on Windows 11) or macOS (tested on macOS Sonoma+)
 
-> **Note:** `tkinter` is included with the standard Python installer on Windows. If it's missing, reinstall Python and make sure "tcl/tk and IDLE" is checked.
+> **Note (Windows):** `tkinter` is included with the standard Python installer on Windows. If it's missing, reinstall Python and make sure "tcl/tk and IDLE" is checked.
+
+> **Note (macOS):** You must grant **Accessibility** permission to your Terminal (or IDE) in **System Settings → Privacy & Security → Accessibility**. Without this, `pyautogui` cannot control the mouse.
 
 ---
 
@@ -41,7 +43,10 @@ cd HandGesture-Mouse
 
 # 2. (Optional) Create a virtual environment
 python -m venv venv
+# Windows:
 venv\Scripts\activate
+# macOS / Linux:
+source venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt

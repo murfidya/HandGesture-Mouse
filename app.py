@@ -9,6 +9,14 @@ Hand Gesture Mouse Control - v1.0.0
 Usage: python app.py
 """
 
+import os
+import sys
+
+# Suppress noisy TFLite / MediaPipe / absl-py C++ logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+
 import argparse
 import asyncio
 import json
@@ -16,7 +24,20 @@ import threading
 import webbrowser
 import time
 import queue
+import platform
 import math
+
+# ── Platform detection ────────────────────────────────────────────────────────
+IS_MACOS = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+
+# macOS: required for pyautogui to work correctly in threads (Obj-C fork safety)
+if IS_MACOS:
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+
+# Redirect stderr temporarily to suppress C++ init logs from MediaPipe/TFLite
+_original_stderr = sys.stderr
+sys.stderr = open(os.devnull, "w")
 
 import cv2
 import mediapipe as mp
@@ -29,6 +50,16 @@ import pyautogui
 import numpy as np
 from aiohttp import web
 
+# Suppress absl-py logging (used internally by MediaPipe)
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except ImportError:
+    pass
+
+# Restore stderr
+sys.stderr = _original_stderr
+
 # ── PyAutoGUI config ──────────────────────────────────────────────────────────
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
@@ -37,7 +68,6 @@ screen_width, screen_height = pyautogui.size()
 print(f"Screen size: {screen_width}x{screen_height}")
 
 # ── Model path ────────────────────────────────────────────────────────────────
-import os
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 if not os.path.exists(MODEL_PATH):
     print("Downloading hand_landmarker.task model...")
@@ -271,7 +301,11 @@ def draw_hand_skeleton(frame, landmarks):
 
 # ── Hand detection thread ─────────────────────────────────────────────────────
 def hand_detection_thread():
-    cap = cv2.VideoCapture(0)
+    # Windows: use DirectShow backend for reliable camera access (avoids black screen)
+    if IS_WINDOWS:
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Could not open camera!")
         state.running = False
@@ -280,7 +314,10 @@ def hand_detection_thread():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 60)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize capture buffer lag
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize capture buffer lag
+    except Exception:
+        pass  # AVFoundation backend on macOS may not support this
 
     frame_count = 0
     fail_count = 0
@@ -296,7 +333,20 @@ def hand_detection_thread():
         min_tracking_confidence=0.5,
     )
 
-    with HandLandmarker.create_from_options(opts) as detector:
+    # Suppress C++ logs from MediaPipe/TFLite during detector init
+    _stderr_fd = os.dup(2)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 2)
+
+    detector_ctx = HandLandmarker.create_from_options(opts)
+
+    # Restore stderr after a brief delay to catch late C++ logs
+    time.sleep(0.3)
+    os.dup2(_stderr_fd, 2)
+    os.close(_devnull)
+    os.close(_stderr_fd)
+
+    with detector_ctx as detector:
         while state.running:
             ret, frame = cap.read()
             if not ret:
@@ -506,16 +556,17 @@ def cursor_update_thread():
 
 
 # ── Always-on-top tkinter camera window ──────────────────────────────────────
-def run_camera_window():
+def run_camera_window_tkinter():
     """Runs the always-on-top floating camera preview using tkinter.
-    MUST be called from the main thread."""
+    MUST be called from the main thread. May not work on macOS with old Tcl/Tk."""
     import tkinter as tk
     from PIL import Image, ImageTk
 
     root = tk.Tk()
     root.title("GestureMouse — Camera")
     root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.95)
+    if not IS_MACOS:
+        root.attributes("-alpha", 0.95)
     root.resizable(True, True)
     root.configure(bg="#0f0f13")
 
@@ -523,16 +574,18 @@ def run_camera_window():
     win_w, win_h = 320, 260
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
-    root.geometry(f"{win_w}x{win_h}+{sw - win_w - 20}+{sh - win_h - 60}")
+    y_offset = 100 if IS_MACOS else 60  # macOS menu bar takes extra space
+    root.geometry(f"{win_w}x{win_h}+{sw - win_w - 20}+{sh - win_h - y_offset}")
 
     # Title bar
     title_bar = tk.Frame(root, bg="#1a1a24", height=28)
     title_bar.pack(fill=tk.X, side=tk.TOP)
     title_bar.pack_propagate(False)
 
+    UI_FONT = "SF Pro" if IS_MACOS else "Segoe UI"
     tk.Label(title_bar, text="● LIVE  GestureMouse",
              bg="#1a1a24", fg="#a29bfe",
-             font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=8)
+             font=(UI_FONT, 9, "bold")).pack(side=tk.LEFT, padx=8)
 
     # Minimize/restore button
     minimized = [False]
@@ -545,7 +598,7 @@ def run_camera_window():
             minimized[0] = True
 
     tk.Button(title_bar, text="—", bg="#2a2a3d", fg="white",
-              relief=tk.FLAT, font=("Segoe UI", 9),
+              relief=tk.FLAT, font=(UI_FONT, 9),
               command=toggle_size, cursor="hand2",
               padx=6).pack(side=tk.RIGHT, padx=4, pady=2)
 
@@ -594,6 +647,54 @@ def run_camera_window():
 
     root.after(100, update_frame)
     root.mainloop()
+
+
+# ── OpenCV camera window (fallback for macOS when tkinter is broken) ─────────
+def run_camera_window_cv2():
+    """Runs the camera preview using OpenCV's highgui (cv2.imshow).
+    Used as fallback on macOS where tkinter's Tcl/Tk may be too old."""
+    WINDOW_NAME = "GestureMouse — Camera"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 400, 300)
+
+    # Create a dark placeholder frame
+    placeholder = np.zeros((300, 400, 3), dtype=np.uint8)
+    placeholder[:] = (19, 15, 15)  # dark bg
+    cv2.putText(placeholder, "Waiting for camera...", (60, 155),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (162, 155, 254), 1, cv2.LINE_AA)
+    cv2.imshow(WINDOW_NAME, placeholder)
+
+    print("  Camera preview: OpenCV window (press ESC or Q to quit)")
+
+    while state.running:
+        try:
+            frame = state.frame_queue.get_nowait()
+            cv2.imshow(WINDOW_NAME, frame)
+        except queue.Empty:
+            pass
+
+        key = cv2.waitKey(16) & 0xFF  # ~60fps, also pumps the event loop
+        if key == 27 or key == ord('q'):  # ESC or Q
+            state.running = False
+            break
+
+        # Check if window was closed via the X button
+        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            state.running = False
+            break
+
+    cv2.destroyAllWindows()
+
+
+def run_camera_window():
+    """Pick the best camera window backend for the current platform."""
+    if IS_MACOS:
+        # macOS: Python 3.9's bundled Tcl/Tk is too old for macOS 26+,
+        # causing an uncatchable C-level abort. Use OpenCV window instead.
+        print("  Using OpenCV camera window (macOS).")
+        run_camera_window_cv2()
+    else:
+        run_camera_window_tkinter()
 
 
 # ── Browser dashboard HTML ────────────────────────────────────────────────────
@@ -1136,6 +1237,20 @@ if __name__ == "__main__":
     print("  Press Ctrl+C or Esc to stop")
     print("=" * 52)
 
+    # macOS: camera authorization must happen on the main thread.
+    # Pre-open camera to trigger the permission dialog, then release it.
+    if IS_MACOS:
+        print("  Requesting camera access...")
+        _cap = cv2.VideoCapture(0)
+        if _cap.isOpened():
+            _cap.release()
+            print("  Camera access granted.")
+        else:
+            print("  ERROR: Camera access denied or unavailable!")
+            print("  Grant camera permission in System Settings → Privacy & Security → Camera.")
+            state.running = False
+        time.sleep(0.5)  # brief pause to let macOS finish releasing the camera
+
     # Start hand detection in background thread
     det_thread = threading.Thread(target=hand_detection_thread, daemon=True)
     det_thread.start()
@@ -1152,7 +1267,7 @@ if __name__ == "__main__":
     if not args.no_browser:
         threading.Thread(target=open_browser, daemon=True).start()
 
-    # Run tkinter camera window on the MAIN thread (required by Tcl/Tk)
+    # Run camera window on the MAIN thread
     try:
         run_camera_window()
     except KeyboardInterrupt:
@@ -1160,3 +1275,5 @@ if __name__ == "__main__":
     finally:
         state.running = False
         print("\nServer stopped.")
+        # Give daemon threads time to finish cleanly before interpreter exits
+        time.sleep(0.3)
